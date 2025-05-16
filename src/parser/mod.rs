@@ -1,10 +1,10 @@
+use std::collections::HashMap;
 use regex::Regex;
 use once_cell::sync::Lazy;
 use serde_json::{Map, Value};
-use serde_json::map::Keys;
 use crate::errors::Errors;
 
-const EXTRACT_NGINX_VALUE_REGEX: Lazy<Regex> = Lazy::new(|| {
+static EXTRACT_NGINX_VALUE_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#""([^"]*)""#).unwrap()
 });
 const PIXEL_GROUP_ID: &str = "action_group_id";
@@ -13,6 +13,15 @@ const ACTION_NAMES_TO_PROCESS: [&str; 8] = ["Gotcha", "PreGotcha", "Reported", "
 const ENCODED_ENTRIES_V1: &str = "encoded_entries_v1";
 const ENTRIES: &str = "entries";
 const CUSTOMFIELDS: &str = "custom_fields";
+
+//todo finish this
+static JSON_TYPE_FIELDS: Lazy<HashMap<&str, &str>> = Lazy::new(|| {
+    let mut m = HashMap::new();
+    m.insert("action_log", "action_log_data");
+    m.insert("details_json", "details_json");
+    m.insert(CUSTOMFIELDS, CUSTOMFIELDS);
+    m
+});
 
 
 fn decode_entries_encoded_in_e1(encoded: Value) -> String {
@@ -40,7 +49,7 @@ fn decode_entries_encoded_in_e1(encoded: Value) -> String {
     }
 }
 
-fn serializeCustomFields(field_value: Vec<Value>) -> Value {
+fn serialize_custom_fields(field_value: Vec<Value>) -> Value {
     let mut out_map = Map::new();
     let mut out_list = Vec::new();
     for e in field_value {
@@ -57,49 +66,58 @@ fn serializeCustomFields(field_value: Vec<Value>) -> Value {
 
 }
 
-    fn flatten(key_name: &str, log_entry: Map<String, Value>) {
-        let mut out_map = Map::new();
-        let prefix = if key_name.is_empty() {
-            key_name.to_string()
-        } else {
-            format!("{key_name}_")
-        };
-        for (key, value) in log_entry {
-           match value {
-               Value::Array(list) => {
-                   match key.as_str() {
-                       ENCODED_ENTRIES_V1 => {
-                           let joined = list.into_iter().map(|x| decode_entries_encoded_in_e1(x)).collect::<Vec<_>>().join(";");
-                           out_map.insert(ENTRIES.to_string(), Value::String(joined));
-                               }
-                       ENTRIES => {
-                           let joined = list.into_iter().map(|x| x.to_string()).collect::<Vec<_>>().join(";");
-                           out_map.insert(ENTRIES.to_string(), Value::String(joined));
-                       }
-                       CUSTOMFIELDS => {
-                           out_map.insert(CUSTOMFIELDS.to_string(), serializeCustomFields(list));
-                       }
-                       _ => {
-                           if list.iter().all(|v| matches!(v, Value::String(_))) {
-                               // All elements are strings — join with ";"
-                               let joined = list
-                                   .into_iter()
-                                   .map(|v| v.to_string())
-                                   .collect::<Vec<_>>()
-                                   .join(";");
-
-                               out_map.insert(key.to_string(), Value::String(joined));
-                           } else {
-                               // Unknown content — serialize the whole array as-is
-                               out_map.insert(key.to_string(), Value::Array(list));
+fn flatten(key_name: &str, log_entry: Map<String, Value>) {
+    let mut out_map = Map::new();
+    let prefix = if key_name.is_empty() {
+        key_name.to_string()
+    } else {
+        format!("{key_name}_")
+    };
+    for (key, value) in log_entry {
+       match value {
+           Value::Array(list) => {
+               match key.as_str() {
+                   ENCODED_ENTRIES_V1 => {
+                       let joined = list.into_iter().map(|x| decode_entries_encoded_in_e1(x)).collect::<Vec<_>>().join(";");
+                       out_map.insert(ENTRIES.to_string(), Value::String(joined));
                            }
+                   ENTRIES => {
+                       let joined = list.into_iter().map(|x| x.to_string()).collect::<Vec<_>>().join(";");
+                       out_map.insert(ENTRIES.to_string(), Value::String(joined));
+                   }
+                   CUSTOMFIELDS => {
+                       out_map.insert(CUSTOMFIELDS.to_string(), serialize_custom_fields(list));
+                   }
+                   _ => {
+                       if list.iter().all(|v| matches!(v, Value::String(_))) {
+                           // All elements are strings — join with ";"
+                           let joined = list
+                               .into_iter()
+                               .map(|v| v.to_string())
+                               .collect::<Vec<_>>()
+                               .join(";");
+
+                           out_map.insert(key.to_string(), Value::String(joined));
+                       } else {
+                           // Unknown content — serialize the whole array as-is
+                           out_map.insert(key.to_string(), Value::Array(list));
                        }
                    }
                }
-               _ => {}
            }
-        }
+           Value::Object(map) => {
+               let filtered_map = map
+                   .into_iter()
+                   .filter(|(key, value)| !value.is_null())
+                   .collect();
+               let map_to_insert = JSON_TYPE_FIELDS
+                   .get(key.as_str())
+                   .map(|value| {});
+           }
+           _ => {}
+       }
     }
+}
 
 
 fn handle_nulls(value: &Value) -> bool {
