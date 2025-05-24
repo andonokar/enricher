@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use regex::Regex;
 use once_cell::sync::Lazy;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
+use crate::action_names::{Enrichable, LineEntry};
 use crate::errors::Errors;
 
 static EXTRACT_NGINX_VALUE_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -60,13 +61,13 @@ fn serialize_custom_fields(field_value: Vec<Value>) -> Value {
         }
     }
     if !out_list.is_empty() {
-        out_map.insert("list".to_string(), Value::Array(out_list));
+        out_map.insert("list".to_string(), json!(out_list));
     }
-    Value::Object(out_map)
+    json!(out_map)
 
 }
 
-fn flatten(key_name: &str, log_entry: Map<String, Value>) {
+fn flatten(key_name: &str, log_entry: Map<String, Value>) -> Map<String, Value> {
     let mut out_map = Map::new();
     let prefix = if key_name.is_empty() {
         key_name.to_string()
@@ -79,11 +80,11 @@ fn flatten(key_name: &str, log_entry: Map<String, Value>) {
                match key.as_str() {
                    ENCODED_ENTRIES_V1 => {
                        let joined = list.into_iter().map(|x| decode_entries_encoded_in_e1(x)).collect::<Vec<_>>().join(";");
-                       out_map.insert(ENTRIES.to_string(), Value::String(joined));
+                       out_map.insert(ENTRIES.to_string(), json!(joined));
                            }
                    ENTRIES => {
                        let joined = list.into_iter().map(|x| x.to_string()).collect::<Vec<_>>().join(";");
-                       out_map.insert(ENTRIES.to_string(), Value::String(joined));
+                       out_map.insert(ENTRIES.to_string(), json!(joined));
                    }
                    CUSTOMFIELDS => {
                        out_map.insert(CUSTOMFIELDS.to_string(), serialize_custom_fields(list));
@@ -97,26 +98,35 @@ fn flatten(key_name: &str, log_entry: Map<String, Value>) {
                                .collect::<Vec<_>>()
                                .join(";");
 
-                           out_map.insert(key.to_string(), Value::String(joined));
+                           out_map.insert(key.to_string(), json!(joined));
                        } else {
                            // Unknown content — serialize the whole array as-is
-                           out_map.insert(key.to_string(), Value::Array(list));
+                           out_map.insert(key.to_string(), json!(list));
                        }
                    }
                }
            }
            Value::Object(map) => {
-               let filtered_map = map
+               let filtered_map: Map<_, _> = map
                    .into_iter()
                    .filter(|(key, value)| !value.is_null())
                    .collect();
                let map_to_insert = JSON_TYPE_FIELDS
                    .get(key.as_str())
-                   .map(|value| {});
+                   .map(|value| {
+                       let mut map = Map::new();
+                       map.insert(value.to_string(), json!(filtered_map));
+                       map
+                   })
+                   .unwrap_or_else(|| flatten(format!("{prefix}{key}").as_str(), filtered_map));
+               out_map.extend(map_to_insert);
            }
-           _ => {}
+           value => {
+               out_map.insert(format!("{prefix}{key}"), json!(value.to_string()));
+           }
        }
     }
+    out_map
 }
 
 
@@ -173,9 +183,9 @@ impl LogEntry<'_> {
     }
 }
 
-pub fn parse(batch_id: i32, line: String) -> Result<(), Errors> {
+pub fn parse(batch_id: i32, line: String) -> Enrichable {
     if line.is_empty() {
-        Err(Errors::EmptyLine)
+        Enrichable::Error(Errors::EmptyLine)
     } else {
         let parts: Vec<_> = line.split('\t').map(|s| s.trim()).collect();
         let log_entry = match parts[..] {
@@ -184,41 +194,55 @@ pub fn parse(batch_id: i32, line: String) -> Result<(), Errors> {
                 LogEntry::new(timestamp, ip, country, eu, subdivision,
                               postal_code, isp, user_agent, request_body, request_uri)
             }
-            _ => return Err(Errors::ParsingError("Incorrect, different than 10 elements".to_string()))
+            _ => return Enrichable::Error(Errors::ParsingError("Incorrect, different than 10 elements".to_string()))
         };
         if log_entry.body.is_empty() || log_entry.user_agent.is_empty() ||
             !log_entry.body.contains(PIXEL_GROUP_ID) {
-            return Err(Errors::EmptyBody)
+            return Enrichable::Error(Errors::EmptyBody)
         }
         let maybe_body_parsed: serde_json::error::Result<Value> = serde_json::from_str(log_entry.body);
         let body_parsed = match maybe_body_parsed {
             Ok(value) => {
                 match value {
                     Value::Object(map) => map,
-                    _ => return Err(Errors::ParsingError("incorrect incoming string".to_string()))
+                    _ => return Enrichable::Error(Errors::ParsingError("incorrect incoming string".to_string()))
                 }
             }
-            Err(_) => return Err(Errors::ParsingError("incorrect incoming string".to_string()))
+            Err(_) => return Enrichable::Error(Errors::ParsingError("incorrect incoming string".to_string()))
         };
         let null_filtered: Map<String, Value> = body_parsed
             .into_iter()
             .filter(|(_, v)| handle_nulls(v))
             .collect();
-        
-        let action_name = match null_filtered.get("action_name") {
-            None => return Err(Errors::ParsingError("action_name not detected".to_string())),
-            Some(value) => match value {
-                Value::String(action_name) => {
-                    if !ACTION_NAMES_TO_PROCESS.contains(&&**action_name) {
-                        return Err(Errors::ParsingError(format!("Skipping: {action_name}")))
-                    }
-                    action_name
-                }
-                _ => return Err(Errors::ParsingError("action_name not detected".to_string()))
+
+        let action_name = match null_filtered.get("action_name").and_then(|v| {
+            if let Value::String(s) = v {
+                Some(s)
+            } else {
+                None
             }
+        }) {
+            Some(s) if ACTION_NAMES_TO_PROCESS.contains(&&**s) => s.clone(),
+            Some(s) => return Enrichable::Error(Errors::ParsingError(format!("Skipping: {s}"))),
+            None => return Enrichable::Error(Errors::ParsingError("action_name not detected".to_string())),
         };
 
-        
-        Ok(())
+        let parsed_body_request = flatten("", null_filtered);
+
+        let line_entry = LineEntry {
+            event_date: log_entry.date.to_string(),
+            source_ip: log_entry.ip.to_string(),
+            country_code: log_entry.country.to_string(),
+            subdivision: log_entry.subdivision.to_string(),
+            postal_code: log_entry.postal_code,
+            eu: log_entry.eu.to_string(),
+            isp: log_entry.isp.to_string(),
+            raw_user_agent: log_entry.user_agent.to_string(),
+            action_name,
+            request_body: parsed_body_request,
+            request_uri: log_entry.request_uri.to_string(),
+            batch_id
+        };
+        line_entry.into_request_body_map()
     }
 }
